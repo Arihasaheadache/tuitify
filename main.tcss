@@ -5,6 +5,17 @@ Screen {
     color: #eeeeee;
 }
 
+/* Loading Screen Styling */
+LoadingScreen {
+    align: center middle;
+    background: $background 80%; /* Semi-transparent background overlay */
+}
+
+LoadingIndicator {
+    color: $accent;
+    height: 100%;
+}
+
 /* Welcome Screen */
 #welcome_box {
     width: 60;
