@@ -1,87 +1,187 @@
 import os
-import time
-import yt_dlp
-import vlc
+import sys
 import json
+import time
+import socket
+import tempfile
+import subprocess
 import threading
-from websocket import create_connection
-
-# DLL Setup
-dll_path = os.path.abspath("dll")
-if os.path.exists(dll_path):
-    os.add_dll_directory(dll_path)
+from typing import Optional, Tuple, Dict, Any
+import yt_dlp
 
 class MusicPlayer:
-    class NullLogger:
-        # Suppresses yt-dlp console output by overriding its logger.
-        def debug(self, msg): pass
-        def warning(self, msg): pass
-        def error(self, msg): pass
+    def __init__(self, mpv_bin: str = "mpv"):
+        self.mpv_bin = mpv_bin
+        self.process: Optional[subprocess.Popen] = None
+        self.ipc_path = self._generate_ipc_path()
+        self.current_song: Dict[str, str] = {"title": "Nothing Playing", "artist": ""}
+        self.is_paused = False
+        self._lock = threading.Lock()
+        self._is_terminating = False
 
-    def __init__(self):
-        self.instance = vlc.Instance('--no-video', '--quiet', '--control=ntsm') 
-        self.player = self.instance.media_player_new()
-        self.ydl_opts = {'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True, 'logger': self.NullLogger()}
-        
-        self.current_metadata = {"title": "Unknown", "artist": "Unknown"}
-        self.ws_url = "ws://127.0.0.1:8974"
+        self.ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+        }
+        self.ydl = yt_dlp.YoutubeDL(self.ydl_opts)
 
-    def broadcast_to_rainmeter(self):
-        # Sends current song metadata to a local WebSocket for Rainmeter integration.
-        def _send():
+        self._spawn_daemon()
+
+    def _generate_ipc_path(self) -> str:
+        if sys.platform == "win32":
+            return r"\\.\pipe\tuitify_mpv_socket"
+        return os.path.join(tempfile.gettempdir(), f"tuitify_mpv_{os.getpid()}.sock")
+
+    def _spawn_daemon(self):
+        if sys.platform != "win32" and os.path.exists(self.ipc_path):
             try:
-                curr, total = self.get_time()
-                state_map = {"Playing": 1, "Paused": 2, "Stopped": 0}
-                state_val = state_map.get(self.get_state(), 0)
+                os.unlink(self.ipc_path)
+            except OSError:
+                pass
 
-                data = {
-                    "player": "Tuitify",
-                    "title": self.current_metadata["title"],
-                    "artist": self.current_metadata["artist"],
-                    "album": "YouTube Music",
-                    "status": state_val,
-                    "position": curr,
-                    "duration": total,
-                    "volume": self.get_volume()
-                }
-                
-                ws = create_connection(self.ws_url, timeout=0.1)
-                ws.send(json.dumps(data))
-                ws.close()
-            except:
-                pass 
+        cmd = [
+            self.mpv_bin,
+            "--idle=yes",
+            "--no-video",
+            "--no-terminal",
+            f"--input-ipc-server={self.ipc_path}",
+            "--audio-display=no",
+            "--gapless-audio=yes"
+        ]
 
-        threading.Thread(target=_send, daemon=True).start()
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NO_WINDOW
 
-    def play_song(self, video_id, title="Unknown", artist="Unknown"):
-        # Extracts a direct stream URL from a YouTube video ID and plays it.
-        self.current_metadata = {"title": title, "artist": artist}
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags
+        )
+        time.sleep(0.25)
+
+    def _send_command(self, command: list, timeout: float = 0.2) -> Optional[Dict[str, Any]]:
+        """Non-blocking command dispatcher with strict timeout prevention."""
+        if self._is_terminating:
+            return None
+
+        # Non-blocking lock attempt to avoid deadlocking during teardown
+        acquired = self._lock.acquire(timeout=timeout)
+        if not acquired:
+            return None
+
         try:
-            with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                stream_url = info['url']
-            
-            media = self.instance.media_new(stream_url)
-            self.player.set_media(media)
-            self.player.play()
-        except Exception as e:
+            payload = json.dumps({"command": command}) + "\n"
+            if sys.platform == "win32":
+                with open(self.ipc_path, "r+b", buffering=0) as pipe:
+                    pipe.write(payload.encode("utf-8"))
+                    res = pipe.readline().decode("utf-8")
+                    return json.loads(res) if res else None
+            else:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(timeout)
+                    sock.connect(self.ipc_path)
+                    sock.sendall(payload.encode("utf-8"))
+                    res = sock.recv(4096).decode("utf-8")
+                    for line in res.splitlines():
+                        if line.strip():
+                            return json.loads(line)
+        except Exception:
+            return None
+        finally:
+            self._lock.release()
+
+        return None
+
+    def play_song(self, video_id: str, title: str = "Unknown", artist: str = "Unknown") -> bool:
+        if self._is_terminating:
+            return False
+
+        self.current_song = {"title": title, "artist": artist}
+        self.is_paused = False
+
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        try:
+            info = self.ydl.extract_info(video_url, download=False)
+            stream_url = info.get('url')
+            if stream_url and not self._is_terminating:
+                self._send_command(["loadfile", stream_url, "replace"])
+                return True
+        except Exception:
+            return False
+        return False
+
+    def toggle_pause(self) -> bool:
+        self._send_command(["cycle", "pause"])
+        self.is_paused = not self.is_paused
+        return self.is_paused
+
+    def stop(self):
+        """Immediately stops audio playback without hanging."""
+        self._send_command(["stop"], timeout=0.1)
+        self.is_paused = False
+
+    def seek(self, seconds: int):
+        self._send_command(["seek", seconds, "relative"])
+
+    def set_volume(self, volume: int):
+        vol = max(0, min(volume, 100))
+        self._send_command(["set_property", "volume", vol])
+
+    def get_volume(self) -> int:
+        if self._is_terminating:
+            return 100
+        res = self._send_command(["get_property", "volume"])
+        if res and "data" in res and res["data"] is not None:
+            return int(res["data"])
+        return 100
+
+    def get_time(self) -> Tuple[int, int]:
+        if self._is_terminating:
+            return 0, 0
+        pos_res = self._send_command(["get_property", "time-pos"])
+        dur_res = self._send_command(["get_property", "duration"])
+
+        pos = int(pos_res["data"]) if pos_res and pos_res.get("data") is not None else 0
+        dur = int(dur_res["data"]) if dur_res and dur_res.get("data") is not None else 0
+        return pos, dur
+
+    def is_finished(self) -> bool:
+        if self._is_terminating:
+            return False
+        res = self._send_command(["get_property", "idle-active"])
+        if res and "data" in res:
+            return bool(res["data"])
+        return False
+
+    def format_time(self, seconds: int) -> str:
+        s = max(0, seconds)
+        return f"{s // 60:02d}:{s % 60:02d}"
+
+    def quit(self):
+        """Signals shutdown flag, terminates mpv directly, and cleans up sockets."""
+        self._is_terminating = True
+
+        # Quick asynchronous quit signal to daemon
+        try:
+            self._send_command(["quit"], timeout=0.05)
+        except Exception:
             pass
 
-    def toggle_pause(self): self.player.pause()
-    def stop(self): self.player.stop()
-    def seek(self, seconds): 
-        curr = self.player.get_time()
-        self.player.set_time(max(0, curr + (seconds * 1000)))
+        # Immediate process kill
+        if self.process:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+            self.process = None
 
-    def set_volume(self, volume): self.player.audio_set_volume(max(0, min(volume, 100)))
-    def get_volume(self): return self.player.audio_get_volume()
-    def get_time(self): return self.player.get_time() // 1000, self.player.get_length() // 1000
-    def format_time(self, seconds): return f"{max(0, seconds) // 60:02d}:{max(0, seconds) % 60:02d}"
-    
-    def get_state(self):
-        s = self.player.get_state().value
-        return {0: "Nothing", 1: "Opening", 2: "Buffering", 3: "Playing", 4: "Paused", 5: "Stopped", 6: "Ended"}.get(s, "Error")
-    
-    def is_finished(self): return self.get_state() == "Ended"
+        # Remove socket file
+        if sys.platform != "win32" and os.path.exists(self.ipc_path):
+            try:
+                os.unlink(self.ipc_path)
+            except OSError:
+                pass
